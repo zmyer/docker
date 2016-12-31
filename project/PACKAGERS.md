@@ -44,8 +44,7 @@ need to package Docker your way, without denaturing it in the process.
 To build Docker, you will need the following:
 
 * A recent version of Git and Mercurial
-* Go version 1.4 or later (Go version 1.5 or later required for hardware signing
-  support in Docker Content Trust)
+* Go version 1.6 or later
 * A clean checkout of the source added to a valid [Go
   workspace](https://golang.org/doc/code.html#Workspaces) under the path
   *src/github.com/docker/docker* (unless you plan to use `AUTO_GOPATH`,
@@ -74,7 +73,7 @@ To use the vendored dependencies, simply make sure the path to "./vendor" is
 included in `GOPATH` (or use `AUTO_GOPATH`, as explained below).
 
 If you would rather (or must, due to distro policy) package these dependencies
-yourself, take a look at "./hack/vendor.sh" for an easy-to-parse list of the
+yourself, take a look at "vendor.conf" for an easy-to-parse list of the
 exact version for each.
 
 NOTE: if you're not able to package the exact version (to the exact commit) of a

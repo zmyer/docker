@@ -1,4 +1,4 @@
-package volumetestutils
+package testutils
 
 import (
 	"fmt"
@@ -108,4 +108,9 @@ func (d *FakeDriver) Get(name string) (volume.Volume, error) {
 		return v, nil
 	}
 	return nil, fmt.Errorf("no such volume")
+}
+
+// Scope returns the local scope
+func (*FakeDriver) Scope() string {
+	return "local"
 }

@@ -89,7 +89,7 @@ func (p *v1Puller) pullRepository(ctx context.Context, ref reference.Named) erro
 		return err
 	}
 
-	logrus.Debugf("Retrieving the tag list")
+	logrus.Debug("Retrieving the tag list")
 	var tagsList map[string]string
 	if !isTagged {
 		tagsList, err = p.session.GetRemoteTags(repoData.Endpoints, p.repoInfo)
@@ -243,13 +243,15 @@ func (p *v1Puller) pullImage(ctx context.Context, v1ID, endpoint string, localNa
 		return err
 	}
 
-	imageID, err := p.config.ImageStore.Create(config)
+	imageID, err := p.config.ImageStore.Put(config)
 	if err != nil {
 		return err
 	}
 
-	if err := p.config.ReferenceStore.AddTag(localNameRef, imageID, true); err != nil {
-		return err
+	if p.config.ReferenceStore != nil {
+		if err := p.config.ReferenceStore.AddTag(localNameRef, imageID, true); err != nil {
+			return err
+		}
 	}
 
 	return nil

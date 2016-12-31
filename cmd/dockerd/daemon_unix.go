@@ -1,4 +1,4 @@
-// +build !windows
+// +build !windows,!solaris
 
 package main
 
@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/docker/docker/cmd/dockerd/hack"
 	"github.com/docker/docker/daemon"
 	"github.com/docker/docker/libcontainerd"
 	"github.com/docker/docker/pkg/system"
@@ -42,7 +43,7 @@ func setDefaultUmask() error {
 	return nil
 }
 
-func getDaemonConfDir() string {
+func getDaemonConfDir(_ string) string {
 	return "/etc/docker"
 }
 
@@ -60,6 +61,7 @@ func (cli *DaemonCli) setupConfigReloadTrap() {
 func (cli *DaemonCli) getPlatformRemoteOptions() []libcontainerd.RemoteOption {
 	opts := []libcontainerd.RemoteOption{
 		libcontainerd.WithDebugLog(cli.Config.Debug),
+		libcontainerd.WithOOMScore(cli.Config.OOMScoreAdjust),
 	}
 	if cli.Config.ContainerdAddr != "" {
 		opts = append(opts, libcontainerd.WithRemoteAddr(cli.Config.ContainerdAddr))
@@ -70,6 +72,10 @@ func (cli *DaemonCli) getPlatformRemoteOptions() []libcontainerd.RemoteOption {
 		args := []string{"--systemd-cgroup=true"}
 		opts = append(opts, libcontainerd.WithRuntimeArgs(args))
 	}
+	if cli.Config.LiveRestoreEnabled {
+		opts = append(opts, libcontainerd.WithLiveRestore(true))
+	}
+	opts = append(opts, libcontainerd.WithRuntimePath(daemon.DefaultRuntimeBinary))
 	return opts
 }
 
@@ -77,6 +83,12 @@ func (cli *DaemonCli) getPlatformRemoteOptions() []libcontainerd.RemoteOption {
 // store their state.
 func (cli *DaemonCli) getLibcontainerdRoot() string {
 	return filepath.Join(cli.Config.ExecRoot, "libcontainerd")
+}
+
+// getSwarmRunRoot gets the root directory for swarm to store runtime state
+// For example, the control socket
+func (cli *DaemonCli) getSwarmRunRoot() string {
+	return filepath.Join(cli.Config.ExecRoot, "swarm")
 }
 
 // allocateDaemonPort ensures that there are no containers
@@ -110,4 +122,16 @@ func allocateDaemonPort(addr string) error {
 
 // notifyShutdown is called after the daemon shuts down but before the process exits.
 func notifyShutdown(err error) {
+}
+
+func wrapListeners(proto string, ls []net.Listener) []net.Listener {
+	switch proto {
+	case "unix":
+		ls[0] = &hack.MalformedHostHeaderOverride{ls[0]}
+	case "fd":
+		for i := range ls {
+			ls[i] = &hack.MalformedHostHeaderOverride{ls[i]}
+		}
+	}
+	return ls
 }

@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
+	networktypes "github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/api/types/versions/v1p20"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/network"
-	"github.com/docker/engine-api/types"
-	networktypes "github.com/docker/engine-api/types/network"
-	"github.com/docker/engine-api/types/versions"
-	"github.com/docker/engine-api/types/versions/v1p20"
 )
 
 // ContainerInspect returns low-level information about a
@@ -23,10 +23,12 @@ func (daemon *Daemon) ContainerInspect(name string, size bool, version string) (
 	case versions.Equal(version, "1.20"):
 		return daemon.containerInspect120(name)
 	}
-	return daemon.containerInspectCurrent(name, size)
+	return daemon.ContainerInspectCurrent(name, size)
 }
 
-func (daemon *Daemon) containerInspectCurrent(name string, size bool) (*types.ContainerJSON, error) {
+// ContainerInspectCurrent returns low-level information about a
+// container in a most recent api version.
+func (daemon *Daemon) ContainerInspectCurrent(name string, size bool) (*types.ContainerJSON, error) {
 	container, err := daemon.GetContainer(name)
 	if err != nil {
 		return nil, err
@@ -38,6 +40,13 @@ func (daemon *Daemon) containerInspectCurrent(name string, size bool) (*types.Co
 	base, err := daemon.getInspectData(container, size)
 	if err != nil {
 		return nil, err
+	}
+
+	apiNetworks := make(map[string]*networktypes.EndpointSettings)
+	for name, epConf := range container.NetworkSettings.Networks {
+		if epConf.EndpointSettings != nil {
+			apiNetworks[name] = epConf.EndpointSettings
+		}
 	}
 
 	mountPoints := addMountPoints(container)
@@ -54,7 +63,7 @@ func (daemon *Daemon) containerInspectCurrent(name string, size bool) (*types.Co
 			SecondaryIPv6Addresses: container.NetworkSettings.SecondaryIPv6Addresses,
 		},
 		DefaultNetworkSettings: daemon.getDefaultNetworkSettings(container.NetworkSettings.Networks),
-		Networks:               container.NetworkSettings.Networks,
+		Networks:               apiNetworks,
 	}
 
 	return &types.ContainerJSON{
@@ -108,6 +117,18 @@ func (daemon *Daemon) getInspectData(container *container.Container, size bool) 
 		hostConfig.Links = append(hostConfig.Links, fmt.Sprintf("%s:%s", child.Name, linkAlias))
 	}
 
+	// We merge the Ulimits from hostConfig with daemon default
+	daemon.mergeUlimits(&hostConfig)
+
+	var containerHealth *types.Health
+	if container.State.Health != nil {
+		containerHealth = &types.Health{
+			Status:        container.State.Health.Status,
+			FailingStreak: container.State.Health.FailingStreak,
+			Log:           append([]*types.HealthcheckResult{}, container.State.Health.Log...),
+		}
+	}
+
 	containerState := &types.ContainerState{
 		Status:     container.State.StateString(),
 		Running:    container.State.Running,
@@ -116,10 +137,11 @@ func (daemon *Daemon) getInspectData(container *container.Container, size bool) 
 		OOMKilled:  container.State.OOMKilled,
 		Dead:       container.State.Dead,
 		Pid:        container.State.Pid,
-		ExitCode:   container.State.ExitCode,
-		Error:      container.State.Error,
+		ExitCode:   container.State.ExitCode(),
+		Error:      container.State.Error(),
 		StartedAt:  container.State.StartedAt.Format(time.RFC3339Nano),
 		FinishedAt: container.State.FinishedAt.Format(time.RFC3339Nano),
+		Health:     containerHealth,
 	}
 
 	contJSONBase := &types.ContainerJSONBase{
@@ -155,7 +177,10 @@ func (daemon *Daemon) getInspectData(container *container.Container, size bool) 
 	contJSONBase.GraphDriver.Name = container.Driver
 
 	graphDriverData, err := container.RWLayer.Metadata()
-	if err != nil {
+	// If container is marked as Dead, the container's graphdriver metadata
+	// could have been removed, it will cause error if we try to get the metadata,
+	// we can ignore the error if the container is dead.
+	if err != nil && !container.Dead {
 		return nil, err
 	}
 	contJSONBase.GraphDriver.Data = graphDriverData
@@ -184,6 +209,7 @@ func (daemon *Daemon) ContainerExecInspect(id string) (*backend.ExecInspect, err
 		CanRemove:     e.CanRemove,
 		ContainerID:   e.ContainerID,
 		DetachKeys:    e.DetachKeys,
+		Pid:           e.Pid,
 	}, nil
 }
 
@@ -221,10 +247,10 @@ func (daemon *Daemon) getBackwardsCompatibleNetworkSettings(settings *network.Se
 
 // getDefaultNetworkSettings creates the deprecated structure that holds the information
 // about the bridge network for a container.
-func (daemon *Daemon) getDefaultNetworkSettings(networks map[string]*networktypes.EndpointSettings) types.DefaultNetworkSettings {
+func (daemon *Daemon) getDefaultNetworkSettings(networks map[string]*network.EndpointSettings) types.DefaultNetworkSettings {
 	var settings types.DefaultNetworkSettings
 
-	if defaultNetwork, ok := networks["bridge"]; ok {
+	if defaultNetwork, ok := networks["bridge"]; ok && defaultNetwork.EndpointSettings != nil {
 		settings.EndpointID = defaultNetwork.EndpointID
 		settings.Gateway = defaultNetwork.Gateway
 		settings.GlobalIPv6Address = defaultNetwork.GlobalIPv6Address

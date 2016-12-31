@@ -4,7 +4,29 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/docker/docker/api/types"
 )
+
+func TestIsValidHealthString(t *testing.T) {
+	contexts := []struct {
+		Health   string
+		Expected bool
+	}{
+		{types.Healthy, true},
+		{types.Unhealthy, true},
+		{types.Starting, true},
+		{types.NoHealthcheck, true},
+		{"fail", false},
+	}
+
+	for _, c := range contexts {
+		v := IsValidHealthString(c.Health)
+		if v != c.Expected {
+			t.Fatalf("Expected %t, but got %t", c.Expected, v)
+		}
+	}
+}
 
 func TestStateRunStop(t *testing.T) {
 	s := NewState()
@@ -19,8 +41,8 @@ func TestStateRunStop(t *testing.T) {
 		if s.Pid != i+100 {
 			t.Fatalf("Pid %v, expected %v", s.Pid, i+100)
 		}
-		if s.ExitCode != 0 {
-			t.Fatalf("ExitCode %v, expected 0", s.ExitCode)
+		if s.ExitCode() != 0 {
+			t.Fatalf("ExitCode %v, expected 0", s.ExitCode())
 		}
 
 		stopped := make(chan struct{})
@@ -30,12 +52,14 @@ func TestStateRunStop(t *testing.T) {
 			atomic.StoreInt64(&exit, int64(exitCode))
 			close(stopped)
 		}()
-		s.SetStoppedLocking(&ExitStatus{ExitCode: i})
+		s.Lock()
+		s.SetStopped(&ExitStatus{ExitCode: i})
+		s.Unlock()
 		if s.IsRunning() {
 			t.Fatal("State is running")
 		}
-		if s.ExitCode != i {
-			t.Fatalf("ExitCode %v, expected %v", s.ExitCode, i)
+		if s.ExitCode() != i {
+			t.Fatalf("ExitCode %v, expected %v", s.ExitCode(), i)
 		}
 		if s.Pid != 0 {
 			t.Fatalf("Pid %v, expected 0", s.Pid)
@@ -65,12 +89,14 @@ func TestStateTimeoutWait(t *testing.T) {
 	}()
 	select {
 	case <-time.After(200 * time.Millisecond):
-		t.Fatal("Stop callback doesn't fire in 100 milliseconds")
+		t.Fatal("Stop callback doesn't fire in 200 milliseconds")
 	case <-stopped:
 		t.Log("Stop callback fired")
 	}
 
-	s.SetStoppedLocking(&ExitStatus{ExitCode: 1})
+	s.Lock()
+	s.SetStopped(&ExitStatus{ExitCode: 1})
+	s.Unlock()
 
 	stopped = make(chan struct{})
 	go func() {
@@ -79,7 +105,7 @@ func TestStateTimeoutWait(t *testing.T) {
 	}()
 	select {
 	case <-time.After(200 * time.Millisecond):
-		t.Fatal("Stop callback doesn't fire in 100 milliseconds")
+		t.Fatal("Stop callback doesn't fire in 200 milliseconds")
 	case <-stopped:
 		t.Log("Stop callback fired")
 	}

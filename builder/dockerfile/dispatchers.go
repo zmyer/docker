@@ -8,19 +8,23 @@ package dockerfile
 // package.
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/pkg/signal"
 	runconfigopts "github.com/docker/docker/runconfig/opts"
-	"github.com/docker/engine-api/types/container"
-	"github.com/docker/engine-api/types/strslice"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -64,13 +68,24 @@ func env(b *Builder, args []string, attributes map[string]bool, original string)
 	for j := 0; j < len(args); j++ {
 		// name  ==> args[j]
 		// value ==> args[j+1]
+
+		if len(args[j]) == 0 {
+			return errBlankCommandNames("ENV")
+		}
 		newVar := args[j] + "=" + args[j+1] + ""
 		commitStr += " " + newVar
 
 		gotOne := false
 		for i, envVar := range b.runConfig.Env {
 			envParts := strings.SplitN(envVar, "=", 2)
-			if envParts[0] == args[j] {
+			compareFrom := envParts[0]
+			compareTo := args[j]
+			if runtime.GOOS == "windows" {
+				// Case insensitive environment variables on Windows
+				compareFrom = strings.ToUpper(compareFrom)
+				compareTo = strings.ToUpper(compareTo)
+			}
+			if compareFrom == compareTo {
 				b.runConfig.Env[i] = newVar
 				gotOne = true
 				break
@@ -127,6 +142,11 @@ func label(b *Builder, args []string, attributes map[string]bool, original strin
 	for j := 0; j < len(args); j++ {
 		// name  ==> args[j]
 		// value ==> args[j+1]
+
+		if len(args[j]) == 0 {
+			return errBlankCommandNames("LABEL")
+		}
+
 		newVar := args[j] + "=" + args[j+1] + ""
 		commitStr += " " + newVar
 
@@ -143,7 +163,7 @@ func label(b *Builder, args []string, attributes map[string]bool, original strin
 //
 func add(b *Builder, args []string, attributes map[string]bool, original string) error {
 	if len(args) < 2 {
-		return errAtLeastOneArgument("ADD")
+		return errAtLeastTwoArguments("ADD")
 	}
 
 	if err := b.flags.Parse(); err != nil {
@@ -159,7 +179,7 @@ func add(b *Builder, args []string, attributes map[string]bool, original string)
 //
 func dispatchCopy(b *Builder, args []string, attributes map[string]bool, original string) error {
 	if len(args) < 2 {
-		return errAtLeastOneArgument("COPY")
+		return errAtLeastTwoArguments("COPY")
 	}
 
 	if err := b.flags.Parse(); err != nil {
@@ -192,7 +212,7 @@ func from(b *Builder, args []string, attributes map[string]bool, original string
 	// Windows cannot support a container with no base image.
 	if name == api.NoBaseImageSpecifier {
 		if runtime.GOOS == "windows" {
-			return fmt.Errorf("Windows does not support FROM scratch")
+			return errors.New("Windows does not support FROM scratch")
 		}
 		b.image = ""
 		b.noBaseImage = true
@@ -209,6 +229,7 @@ func from(b *Builder, args []string, attributes map[string]bool, original string
 			}
 		}
 	}
+	b.from = image
 
 	return b.processImageFrom(image)
 }
@@ -234,7 +255,7 @@ func onbuild(b *Builder, args []string, attributes map[string]bool, original str
 	triggerInstruction := strings.ToUpper(strings.TrimSpace(args[0]))
 	switch triggerInstruction {
 	case "ONBUILD":
-		return fmt.Errorf("Chaining ONBUILD via `ONBUILD ONBUILD` isn't allowed")
+		return errors.New("Chaining ONBUILD via `ONBUILD ONBUILD` isn't allowed")
 	case "MAINTAINER", "FROM":
 		return fmt.Errorf("%s isn't allowed as an ONBUILD trigger", triggerInstruction)
 	}
@@ -266,14 +287,44 @@ func workdir(b *Builder, args []string, attributes map[string]bool, original str
 		return err
 	}
 
-	return b.commit("", b.runConfig.Cmd, fmt.Sprintf("WORKDIR %v", workdir))
+	// For performance reasons, we explicitly do a create/mkdir now
+	// This avoids having an unnecessary expensive mount/unmount calls
+	// (on Windows in particular) during each container create.
+	// Prior to 1.13, the mkdir was deferred and not executed at this step.
+	if b.disableCommit {
+		// Don't call back into the daemon if we're going through docker commit --change "WORKDIR /foo".
+		// We've already updated the runConfig and that's enough.
+		return nil
+	}
+	b.runConfig.Image = b.image
+
+	if hit, err := b.probeCache(); err != nil {
+		return err
+	} else if hit {
+		return nil
+	}
+
+	// Actually copy the struct
+	workdirConfig := *b.runConfig
+	workdirConfig.Cmd = strslice.StrSlice(append(getShell(b.runConfig), fmt.Sprintf("#(nop) WORKDIR %s", b.runConfig.WorkingDir)))
+
+	container, err := b.docker.ContainerCreate(types.ContainerCreateConfig{Config: &workdirConfig})
+	if err != nil {
+		return err
+	}
+	b.tmpContainers[container.ID] = struct{}{}
+	if err := b.docker.ContainerCreateWorkdir(container.ID); err != nil {
+		return err
+	}
+
+	return b.commit(container.ID, b.runConfig.Cmd, "WORKDIR "+b.runConfig.WorkingDir)
 }
 
 // RUN some command yo
 //
 // run a command and commit the image. Args are automatically prepended with
-// 'sh -c' under linux or 'cmd /S /C' under Windows, in the event there is
-// only one argument. The difference in processing:
+// the current SHELL which defaults to 'sh -c' under linux or 'cmd /S /C' under
+// Windows, in the event there is only one argument The difference in processing:
 //
 // RUN echo hi          # sh -c echo hi       (Linux)
 // RUN echo hi          # cmd /S /C echo hi   (Windows)
@@ -281,7 +332,7 @@ func workdir(b *Builder, args []string, attributes map[string]bool, original str
 //
 func run(b *Builder, args []string, attributes map[string]bool, original string) error {
 	if b.image == "" && !b.noBaseImage {
-		return fmt.Errorf("Please provide a source image with `from` prior to run")
+		return errors.New("Please provide a source image with `from` prior to run")
 	}
 
 	if err := b.flags.Parse(); err != nil {
@@ -291,13 +342,8 @@ func run(b *Builder, args []string, attributes map[string]bool, original string)
 	args = handleJSONArgs(args, attributes)
 
 	if !attributes["json"] {
-		if runtime.GOOS != "windows" {
-			args = append([]string{"/bin/sh", "-c"}, args...)
-		} else {
-			args = append([]string{"cmd", "/S", "/C"}, args...)
-		}
+		args = append(getShell(b.runConfig), args...)
 	}
-
 	config := &container.Config{
 		Cmd:   strslice.StrSlice(args),
 		Image: b.image,
@@ -339,8 +385,8 @@ func run(b *Builder, args []string, attributes map[string]bool, original string)
 			// the entire file (see 'leftoverArgs' processing in evaluator.go )
 			continue
 		}
-		if _, ok := configEnv[key]; !ok {
-			cmdBuildEnv = append(cmdBuildEnv, fmt.Sprintf("%s=%s", key, val))
+		if _, ok := configEnv[key]; !ok && val != nil {
+			cmdBuildEnv = append(cmdBuildEnv, fmt.Sprintf("%s=%s", key, *val))
 		}
 	}
 
@@ -406,14 +452,12 @@ func cmd(b *Builder, args []string, attributes map[string]bool, original string)
 	cmdSlice := handleJSONArgs(args, attributes)
 
 	if !attributes["json"] {
-		if runtime.GOOS != "windows" {
-			cmdSlice = append([]string{"/bin/sh", "-c"}, cmdSlice...)
-		} else {
-			cmdSlice = append([]string{"cmd", "/S", "/C"}, cmdSlice...)
-		}
+		cmdSlice = append(getShell(b.runConfig), cmdSlice...)
 	}
 
 	b.runConfig.Cmd = strslice.StrSlice(cmdSlice)
+	// set config as already being escaped, this prevents double escaping on windows
+	b.runConfig.ArgsEscaped = true
 
 	if err := b.commit("", b.runConfig.Cmd, fmt.Sprintf("CMD %q", cmdSlice)); err != nil {
 		return err
@@ -426,10 +470,111 @@ func cmd(b *Builder, args []string, attributes map[string]bool, original string)
 	return nil
 }
 
+// parseOptInterval(flag) is the duration of flag.Value, or 0 if
+// empty. An error is reported if the value is given and is not positive.
+func parseOptInterval(f *Flag) (time.Duration, error) {
+	s := f.Value
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("Interval %#v must be positive", f.name)
+	}
+	return d, nil
+}
+
+// HEALTHCHECK foo
+//
+// Set the default healthcheck command to run in the container (which may be empty).
+// Argument handling is the same as RUN.
+//
+func healthcheck(b *Builder, args []string, attributes map[string]bool, original string) error {
+	if len(args) == 0 {
+		return errAtLeastOneArgument("HEALTHCHECK")
+	}
+	typ := strings.ToUpper(args[0])
+	args = args[1:]
+	if typ == "NONE" {
+		if len(args) != 0 {
+			return errors.New("HEALTHCHECK NONE takes no arguments")
+		}
+		test := strslice.StrSlice{typ}
+		b.runConfig.Healthcheck = &container.HealthConfig{
+			Test: test,
+		}
+	} else {
+		if b.runConfig.Healthcheck != nil {
+			oldCmd := b.runConfig.Healthcheck.Test
+			if len(oldCmd) > 0 && oldCmd[0] != "NONE" {
+				fmt.Fprintf(b.Stdout, "Note: overriding previous HEALTHCHECK: %v\n", oldCmd)
+			}
+		}
+
+		healthcheck := container.HealthConfig{}
+
+		flInterval := b.flags.AddString("interval", "")
+		flTimeout := b.flags.AddString("timeout", "")
+		flRetries := b.flags.AddString("retries", "")
+
+		if err := b.flags.Parse(); err != nil {
+			return err
+		}
+
+		switch typ {
+		case "CMD":
+			cmdSlice := handleJSONArgs(args, attributes)
+			if len(cmdSlice) == 0 {
+				return errors.New("Missing command after HEALTHCHECK CMD")
+			}
+
+			if !attributes["json"] {
+				typ = "CMD-SHELL"
+			}
+
+			healthcheck.Test = strslice.StrSlice(append([]string{typ}, cmdSlice...))
+		default:
+			return fmt.Errorf("Unknown type %#v in HEALTHCHECK (try CMD)", typ)
+		}
+
+		interval, err := parseOptInterval(flInterval)
+		if err != nil {
+			return err
+		}
+		healthcheck.Interval = interval
+
+		timeout, err := parseOptInterval(flTimeout)
+		if err != nil {
+			return err
+		}
+		healthcheck.Timeout = timeout
+
+		if flRetries.Value != "" {
+			retries, err := strconv.ParseInt(flRetries.Value, 10, 32)
+			if err != nil {
+				return err
+			}
+			if retries < 1 {
+				return fmt.Errorf("--retries must be at least 1 (not %d)", retries)
+			}
+			healthcheck.Retries = int(retries)
+		} else {
+			healthcheck.Retries = 0
+		}
+
+		b.runConfig.Healthcheck = &healthcheck
+	}
+
+	return b.commit("", b.runConfig.Cmd, fmt.Sprintf("HEALTHCHECK %q", b.runConfig.Healthcheck))
+}
+
 // ENTRYPOINT /usr/sbin/nginx
 //
-// Set the entrypoint (which defaults to sh -c on linux, or cmd /S /C on Windows) to
-// /usr/sbin/nginx. Will accept the CMD as the arguments to /usr/sbin/nginx.
+// Set the entrypoint to /usr/sbin/nginx. Will accept the CMD as the arguments
+// to /usr/sbin/nginx. Uses the default shell if not in JSON format.
 //
 // Handles command processing similar to CMD and RUN, only b.runConfig.Entrypoint
 // is initialized at NewBuilder time instead of through argument parsing.
@@ -450,11 +595,7 @@ func entrypoint(b *Builder, args []string, attributes map[string]bool, original 
 		b.runConfig.Entrypoint = nil
 	default:
 		// ENTRYPOINT echo hi
-		if runtime.GOOS != "windows" {
-			b.runConfig.Entrypoint = strslice.StrSlice{"/bin/sh", "-c", parsed[0]}
-		} else {
-			b.runConfig.Entrypoint = strslice.StrSlice{"cmd", "/S", "/C", parsed[0]}
-		}
+		b.runConfig.Entrypoint = strslice.StrSlice(append(getShell(b.runConfig), parsed[0]))
 	}
 
 	// when setting the entrypoint if a CMD was not explicitly set then
@@ -548,7 +689,7 @@ func volume(b *Builder, args []string, attributes map[string]bool, original stri
 	for _, v := range args {
 		v = strings.TrimSpace(v)
 		if v == "" {
-			return fmt.Errorf("Volume specified can not be an empty string")
+			return errors.New("VOLUME specified can not be an empty string")
 		}
 		b.runConfig.Volumes[v] = struct{}{}
 	}
@@ -563,7 +704,7 @@ func volume(b *Builder, args []string, attributes map[string]bool, original stri
 // Set the signal that will be used to kill the container.
 func stopSignal(b *Builder, args []string, attributes map[string]bool, original string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("STOPSIGNAL requires exactly one argument")
+		return errExactlyOneArgument("STOPSIGNAL")
 	}
 
 	sig := args[0]
@@ -583,12 +724,12 @@ func stopSignal(b *Builder, args []string, attributes map[string]bool, original 
 // Dockerfile author may optionally set a default value of this variable.
 func arg(b *Builder, args []string, attributes map[string]bool, original string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("ARG requires exactly one argument definition")
+		return errExactlyOneArgument("ARG")
 	}
 
 	var (
 		name       string
-		value      string
+		newValue   string
 		hasDefault bool
 	)
 
@@ -600,8 +741,12 @@ func arg(b *Builder, args []string, attributes map[string]bool, original string)
 	// name-value pair). If possible, it will be good to harmonize the two.
 	if strings.Contains(arg, "=") {
 		parts := strings.SplitN(arg, "=", 2)
+		if len(parts[0]) == 0 {
+			return errBlankCommandNames("ARG")
+		}
+
 		name = parts[0]
-		value = parts[1]
+		newValue = parts[1]
 		hasDefault = true
 	} else {
 		name = arg
@@ -612,12 +757,37 @@ func arg(b *Builder, args []string, attributes map[string]bool, original string)
 
 	// If there is a default value associated with this arg then add it to the
 	// b.buildArgs if one is not already passed to the builder. The args passed
-	// to builder override the default value of 'arg'.
-	if _, ok := b.options.BuildArgs[name]; !ok && hasDefault {
-		b.options.BuildArgs[name] = value
+	// to builder override the default value of 'arg'. Note that a 'nil' for
+	// a value means that the user specified "--build-arg FOO" and "FOO" wasn't
+	// defined as an env var - and in that case we DO want to use the default
+	// value specified in the ARG cmd.
+	if baValue, ok := b.options.BuildArgs[name]; (!ok || baValue == nil) && hasDefault {
+		b.options.BuildArgs[name] = &newValue
 	}
 
 	return b.commit("", b.runConfig.Cmd, fmt.Sprintf("ARG %s", arg))
+}
+
+// SHELL powershell -command
+//
+// Set the non-default shell to use.
+func shell(b *Builder, args []string, attributes map[string]bool, original string) error {
+	if err := b.flags.Parse(); err != nil {
+		return err
+	}
+	shellSlice := handleJSONArgs(args, attributes)
+	switch {
+	case len(shellSlice) == 0:
+		// SHELL []
+		return errAtLeastOneArgument("SHELL")
+	case attributes["json"]:
+		// SHELL ["powershell", "-command"]
+		b.runConfig.Shell = strslice.StrSlice(shellSlice)
+	default:
+		// SHELL powershell -command - not JSON
+		return errNotJSON("SHELL", original)
+	}
+	return b.commit("", b.runConfig.Cmd, fmt.Sprintf("SHELL %v", shellSlice))
 }
 
 func errAtLeastOneArgument(command string) error {
@@ -628,6 +798,23 @@ func errExactlyOneArgument(command string) error {
 	return fmt.Errorf("%s requires exactly one argument", command)
 }
 
+func errAtLeastTwoArguments(command string) error {
+	return fmt.Errorf("%s requires at least two arguments", command)
+}
+
+func errBlankCommandNames(command string) error {
+	return fmt.Errorf("%s names can not be blank", command)
+}
+
 func errTooManyArguments(command string) error {
 	return fmt.Errorf("Bad input to %s, too many arguments", command)
+}
+
+// getShell is a helper function which gets the right shell for prefixing the
+// shell-form of RUN, ENTRYPOINT and CMD instructions
+func getShell(c *container.Config) []string {
+	if 0 == len(c.Shell) {
+		return defaultShell[:]
+	}
+	return c.Shell[:]
 }
